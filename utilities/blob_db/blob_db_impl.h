@@ -320,7 +320,10 @@ class BlobDBImpl : public BlobDB {
 
   Status PutBlobValue(const WriteOptions& options, const Slice& key,
                       const Slice& value, uint64_t expiration,
-                      SequenceNumber sequence, WriteBatch* batch);
+                      SequenceNumber sequence, WriteBatch* batch, uint64_t* file_number = nullptr,
+                      uint64_t* header_time = nullptr,
+                      uint64_t* compression_time = nullptr,
+                      uint64_t* file_time = nullptr);
 
   Status AppendBlob(const std::shared_ptr<BlobFile>& bfile,
                     const std::string& headerbuf, const Slice& key,

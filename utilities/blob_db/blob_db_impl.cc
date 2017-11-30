@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 
 #include "db/db_impl.h"
 #include "db/write_batch_internal.h"
@@ -672,19 +673,35 @@ class BlobDBImpl::BlobInserter : public WriteBatch::Handler {
   BlobDBImpl* blob_db_impl_;
   uint32_t default_cf_id_;
   SequenceNumber sequence_;
+  Env* env_;
+  Statistics* statistics_;
   WriteBatch batch_;
+  std::unordered_set<uint64_t> files_;
+  uint64_t ttl_extractor_time_ = 0;
+  uint64_t header_time_ = 0;
+  uint64_t compression_time_ = 0;
+  uint64_t file_time_ = 0;
 
  public:
   BlobInserter(const WriteOptions& options, BlobDBImpl* blob_db_impl,
-               uint32_t default_cf_id, SequenceNumber seq)
+               uint32_t default_cf_id, SequenceNumber seq, Env* env, Statistics* statistics)
       : options_(options),
         blob_db_impl_(blob_db_impl),
         default_cf_id_(default_cf_id),
-        sequence_(seq) {}
+        sequence_(seq), env_(env), statistics_(statistics) {}
+
+  virtual ~BlobInserter() {
+    MeasureTime(statistics_, BLOB_DB_WRITE_TTL_EXTRACTOR_MICROS, ttl_extractor_time_);
+    MeasureTime(statistics_, BLOB_DB_WRITE_HEADER_MICROS, header_time_);
+    MeasureTime(statistics_, BLOB_DB_WRITE_COMPRESSION_MICROS, compression_time_);
+    MeasureTime(statistics_, BLOB_DB_WRITE_FILE_MICROS, file_time_);
+  }
 
   SequenceNumber sequence() { return sequence_; }
 
   WriteBatch* batch() { return &batch_; }
+
+  size_t FilesWritten() { return files_.size(); }
 
   virtual Status PutCF(uint32_t column_family_id, const Slice& key,
                        const Slice& value) override {
@@ -694,10 +711,17 @@ class BlobDBImpl::BlobInserter : public WriteBatch::Handler {
     }
     std::string new_value;
     Slice value_slice;
-    uint64_t expiration =
+    uint64_t expiration = 0;
+    {
+      StopWatch ttl_sw(env_, nullptr, 0, &ttl_extractor_time_, false);
+      expiration =
         blob_db_impl_->ExtractExpiration(key, value, &value_slice, &new_value);
+    }
+    uint64_t file_number;
     Status s = blob_db_impl_->PutBlobValue(options_, key, value_slice,
-                                           expiration, sequence_, &batch_);
+                                           expiration, sequence_, &batch_, &file_number,
+                                           &header_time_, &compression_time_, &file_time_);
+    files_.insert(file_number);
     sequence_++;
     return s;
   }
@@ -748,14 +772,18 @@ Status BlobDBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   // from write batch after DB write instead.
   SequenceNumber current_seq = GetLatestSequenceNumber() + 1;
   Status s;
-  BlobInserter blob_inserter(options, this, default_cf_id, current_seq);
+  BlobInserter blob_inserter(options, this, default_cf_id, current_seq, env_, statistics_);
   {
     // Release write_mutex_ before DB write to avoid race condition with
     // flush begin listener, which also require write_mutex_ to sync
     // blob files.
+    std::unique_ptr<StopWatch> mutex_sw(new StopWatch(env_, statistics_, BLOB_DB_WRITE_MUTEX_MICROS));
     MutexLock l(&write_mutex_);
+    mutex_sw.reset();
+    StopWatch iterate_sw(env_, statistics_, BLOB_DB_WRITE_ITERATE_WRITE_BATCH_MICROS);
     s = updates->Iterate(&blob_inserter);
   }
+  MeasureTime(statistics_, BLOB_DB_WRITE_NUM_BLOB_FILES, blob_inserter.FilesWritten());
   if (!s.ok()) {
     return s;
   }
@@ -876,7 +904,9 @@ Status BlobDBImpl::PutUntil(const WriteOptions& options, const Slice& key,
 
 Status BlobDBImpl::PutBlobValue(const WriteOptions& options, const Slice& key,
                                 const Slice& value, uint64_t expiration,
-                                SequenceNumber sequence, WriteBatch* batch) {
+                                SequenceNumber sequence, WriteBatch* batch,
+                                uint64_t* file_number, uint64_t* header_time,
+                                uint64_t* compression_time, uint64_t* file_time) {
   Status s;
   std::string index_entry;
   uint32_t column_family_id =
@@ -901,15 +931,29 @@ Status BlobDBImpl::PutBlobValue(const WriteOptions& options, const Slice& key,
       return Status::NotFound("Blob file not found");
     }
 
+    if (file_number != nullptr) {
+      *file_number = bfile->BlobFileNumber();
+    }
+
     assert(bfile->compression() == bdb_options_.compression);
     std::string compression_output;
-    Slice value_compressed = GetCompressedSlice(value, &compression_output);
+    Slice value_compressed;
+    {
+      StopWatch compress_sw(env_, nullptr, 0, compression_time, false);
+      value_compressed = GetCompressedSlice(value, &compression_output);
+    }
 
     std::string headerbuf;
-    Writer::ConstructBlobHeader(&headerbuf, key, value_compressed, expiration);
+    {
+      StopWatch header_sw(env_, nullptr, 0, header_time, false);
+      Writer::ConstructBlobHeader(&headerbuf, key, value_compressed, expiration);
+    }
 
-    s = AppendBlob(bfile, headerbuf, key, value_compressed, expiration,
-                   &index_entry);
+    {
+      StopWatch file_sw(env_, nullptr, 0, file_time, false);
+      s = AppendBlob(bfile, headerbuf, key, value_compressed, expiration,
+                     &index_entry);
+    }
     if (expiration == kNoExpiration) {
       RecordTick(statistics_, BLOB_DB_WRITE_BLOB);
     } else {
